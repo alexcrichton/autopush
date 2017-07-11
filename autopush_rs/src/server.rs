@@ -4,15 +4,16 @@ use std::io;
 use std::panic;
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
 use futures::executor::{spawn, Spawn};
-use futures::future::ok;
+use futures::future::{ok, Either};
 use futures::sync::mpsc;
 use futures::sync::oneshot;
-use futures::{Stream, Future, Sink, Async};
+use futures::{Stream, Future, Sink, Async, IntoFuture};
 use libc::c_char;
 use tokio_core::net::TcpListener;
-use tokio_core::reactor::Core;
+use tokio_core::reactor::{Core, Timeout, Handle};
 use tokio_tungstenite::accept_async;
 use tungstenite::Error;
 
@@ -128,14 +129,14 @@ fn init(addr: &str, tx: mpsc::Sender<ClientInner>) -> io::Result<Core> {
     let ws_listener = TcpListener::bind(&addr.parse().unwrap(), &handle)?;
 
     let handle = core.handle();
+    let handle2 = core.handle();
     let ws_srv = ws_listener.incoming()
         .map_err(Error::Io)
 
         // First up perform the websocket handshake on each connection
-        //
-        // TODO: time this out
-        .map(|(socket, addr)| {
-            accept_async(socket).then(move |s| Ok((s, addr)))
+        .map(move |(socket, addr)| {
+            timeout(accept_async(socket), Duration::new(2, 0), &handle2)
+                .then(move |s| Ok((s, addr)))
         })
 
         // Let up to 100 handshakes proceed in parallel
@@ -209,4 +210,22 @@ impl Drop for ServerInner {
         drop(self.tx.take());
         self.thread.take().unwrap().join().unwrap();
     }
+}
+
+fn timeout<F>(f: F, dur: Duration, handle: &Handle)
+    -> Box<Future<Item = F::Item, Error = Error>>
+    where F: Future<Error = Error> + 'static,
+{
+    let timeout = Timeout::new(dur, handle).into_future().flatten();
+    Box::new(f.select2(timeout).then(|res| {
+        match res {
+            Ok(Either::A((item, _timeout))) => Ok(item),
+            Err(Either::A((e, _timeout))) => Err(e),
+            Ok(Either::B(((), _item))) => {
+                let msg = "timed out";
+                Err(Error::Io(io::Error::new(io::ErrorKind::Other, msg)))
+            }
+            Err(Either::B((e, _item))) => Err(Error::Io(e)),
+        }
+    }))
 }
