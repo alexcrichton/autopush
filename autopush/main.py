@@ -34,10 +34,7 @@ from autopush.logging import PushLogger
 from autopush.main_argparse import parse_connection, parse_endpoint
 from autopush.router import routers_from_settings
 from autopush.settings import AutopushSettings
-from autopush.websocket import (
-    ConnectionWSSite,
-    PushServerFactory,
-)
+from autopush_rs import AutopushServer
 
 log = Logger()
 
@@ -225,8 +222,6 @@ class ConnectionApplication(AutopushMultiService):
     logger_name = "Autopush"
 
     internal_router_factory = InternalRouterHTTPFactory
-    websocket_factory = PushServerFactory
-    websocket_site_factory = ConnectionWSSite
 
     def __init__(self, *args, **kwargs):
         super(ConnectionApplication, self).__init__(*args, **kwargs)
@@ -255,11 +250,10 @@ class ConnectionApplication(AutopushMultiService):
 
     def add_websocket(self):
         """Start the public WebSocket server"""
-        settings = self.settings
-        ws_factory = self.websocket_factory(settings, self.db, self.agent,
-                                            self.clients)
-        site_factory = self.websocket_site_factory(settings, ws_factory)
-        self.add_maybe_ssl(settings.port, site_factory, site_factory.ssl_cf())
+        self.addService(AutopushServer(self.settings,
+                                       self.db,
+                                       self.agent,
+                                       self.clients))
 
     @classmethod
     def from_argparse(cls, ns):

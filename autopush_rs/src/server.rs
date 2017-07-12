@@ -1,7 +1,9 @@
-use std::cell::RefCell;
+use std::any::Any;
+use std::cell::{Cell, RefCell};
 use std::ffi::CStr;
 use std::io;
 use std::panic;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -26,31 +28,109 @@ pub struct AutopushServer {
     inner: UnwindGuard<ServerInner>,
 }
 
+#[repr(C)]
+pub struct AutopushServerOptions {
+    pub debug: i32,
+    pub port: u16,
+    pub url: *const c_char,
+    pub ssl_key: *const c_char,
+    pub ssl_cert: *const c_char,
+    pub ssl_dh_param: *const c_char,
+    pub open_handshake_timeout: u32,
+    pub auto_ping_interval: u32,
+    pub auto_ping_timeout: u32,
+    pub max_connections: u32,
+    pub close_handshake_timeout: u32,
+}
+
 pub struct ServerInner {
     rx: RefCell<Spawn<mpsc::Receiver<ClientInner>>>,
-    notify: Arc<MyNotify>,
+    notify: RefCell<Arc<MyNotify>>,
 
     // Used when shutting down a server
-    tx: Option<oneshot::Sender<()>>,
-    thread: Option<thread::JoinHandle<()>>,
+    tx: Cell<Option<oneshot::Sender<()>>>,
+    thread: Cell<Option<thread::JoinHandle<()>>>,
+}
+
+struct ServerOptions {
+    debug: bool,
+    port: u16,
+    url: String,
+    ssl_key: Option<PathBuf>,
+    ssl_cert: Option<PathBuf>,
+    ssl_dh_param: Option<PathBuf>,
+    open_handshake_timeout: Duration,
+    auto_ping_interval: Duration,
+    auto_ping_timeout: Duration,
+    max_connections: u32,
+    close_handshake_timeout: Duration,
 }
 
 #[no_mangle]
-pub extern "C" fn autopush_server_new(addr: *const c_char,
-                                      cb: extern fn(usize),
+pub extern "C" fn autopush_server_new(opts: *const AutopushServerOptions,
                                       err: &mut AutopushError)
     -> *mut AutopushServer
 {
+    unsafe fn to_s<'a>(ptr: *const c_char) -> Option<&'a str> {
+        if ptr.is_null() {
+            None
+        } else {
+            let s = CStr::from_ptr(ptr).to_str().expect("invalid utf-8");
+            if s.is_empty() {
+                None
+            } else {
+                Some(s)
+            }
+        }
+    }
+
+    unsafe fn to_dur(seconds: u32) -> Duration {
+        Duration::new(seconds.into(), 0)
+    }
+
     rt::catch(err, || unsafe {
-        let addr = CStr::from_ptr(addr).to_str().unwrap();
+        let opts = &*opts;
 
         // TODO: returning results to python?
-        let inner = ServerInner::new(addr, cb).expect("failed to start");
+        let inner = ServerInner::new(ServerOptions {
+            debug: opts.debug != 0,
+            port: opts.port,
+            url: to_s(opts.url).expect("url must be specified").to_string(),
+            ssl_key: to_s(opts.ssl_key).map(PathBuf::from),
+            ssl_cert: to_s(opts.ssl_cert).map(PathBuf::from),
+            ssl_dh_param: to_s(opts.ssl_dh_param).map(PathBuf::from),
+            auto_ping_interval: to_dur(opts.auto_ping_interval),
+            auto_ping_timeout: to_dur(opts.auto_ping_timeout),
+            close_handshake_timeout: to_dur(opts.close_handshake_timeout),
+            max_connections: opts.max_connections,
+            open_handshake_timeout: to_dur(opts.open_handshake_timeout),
+        }).expect("failed to start");
 
         Box::new(AutopushServer {
             inner: UnwindGuard::new(inner),
         })
     })
+}
+
+#[no_mangle]
+pub extern "C" fn autopush_server_start(srv: *mut AutopushServer,
+                                        cb: extern fn(usize),
+                                        err: &mut AutopushError) -> i32 {
+    unsafe {
+        (*srv).inner.catch(err, |srv| {
+            *srv.notify.borrow_mut() = Arc::new(MyNotify(cb));
+        })
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn autopush_server_stop(srv: *mut AutopushServer,
+                                       err: &mut AutopushError) -> i32 {
+    unsafe {
+        (*srv).inner.catch(err, |srv| {
+            srv.stop().expect("tokio thread panicked");
+        })
+    }
 }
 
 #[no_mangle]
@@ -75,15 +155,18 @@ pub extern "C" fn autopush_server_accept_client(srv: *mut AutopushServer,
         })
     }
 }
-
 impl ServerInner {
-    fn new(addr: &str, cb: extern fn(usize)) -> io::Result<ServerInner> {
+    fn new(opts: ServerOptions) -> io::Result<ServerInner> {
         let (donetx, donerx) = oneshot::channel();
-        let addr = addr.to_string();
         let (inittx, initrx) = oneshot::channel();
         let (tx, rx) = mpsc::channel(0);
+
+        assert!(opts.ssl_key.is_none(), "ssl not supported");
+        assert!(opts.ssl_cert.is_none(), "ssl not supported");
+        assert!(opts.ssl_dh_param.is_none(), "ssl not supported");
+
         let thread = thread::spawn(move || {
-            let mut core = match init(&addr, tx) {
+            let mut core = match init(opts, tx) {
                 Ok(core) => {
                     inittx.send(None).unwrap();
                     core
@@ -96,11 +179,13 @@ impl ServerInner {
         match initrx.wait() {
             Ok(Some(e)) => Err(e),
             Ok(None) => {
+                extern fn dummy(_: usize) {}
+
                 Ok(ServerInner {
-                    tx: Some(donetx),
-                    thread: Some(thread),
+                    tx: Cell::new(Some(donetx)),
+                    thread: Cell::new(Some(thread)),
                     rx: RefCell::new(spawn(rx)),
-                    notify: Arc::new(MyNotify(cb)),
+                    notify: RefCell::new(Arc::new(MyNotify(dummy))),
                 })
             }
             Err(_) => {
@@ -111,22 +196,36 @@ impl ServerInner {
 
     fn accept_client(&self) -> Option<ClientInner> {
         let mut rx = self.rx.borrow_mut();
-        match rx.poll_stream_notify(&self.notify, 0).expect("streams cannot error") {
+        let notify = self.notify.borrow();
+        match rx.poll_stream_notify(&*notify, 0).expect("streams cannot error") {
             Async::Ready(Some(client)) => Some(client),
             Async::Ready(None) => panic!("I/O thread is gone"),
             Async::NotReady => None,
         }
     }
 
-    pub fn notify(&self) -> &Arc<MyNotify> {
-        &self.notify
+    pub fn notify(&self) -> Arc<MyNotify> {
+        self.notify.borrow().clone()
+    }
+
+    fn stop(&self) -> Result<(), Box<Any+Send>> {
+        drop(self.tx.take());
+        if let Some(thread) = self.thread.take() {
+            thread.join()?;
+        }
+        Ok(())
     }
 }
 
-fn init(addr: &str, tx: mpsc::Sender<ClientInner>) -> io::Result<Core> {
+fn init(opts: ServerOptions, tx: mpsc::Sender<ClientInner>) -> io::Result<Core> {
     let core = Core::new()?;
     let handle = core.handle();
+    let addr = format!("127.0.0.1:{}", opts.port);
     let ws_listener = TcpListener::bind(&addr.parse().unwrap(), &handle)?;
+
+    assert!(opts.ssl_key.is_none(), "ssl not supported yet");
+    assert!(opts.ssl_cert.is_none(), "ssl not supported yet");
+    assert!(opts.ssl_dh_param.is_none(), "ssl not supported yet");
 
     let handle = core.handle();
     let handle2 = core.handle();
@@ -207,8 +306,7 @@ fn init(addr: &str, tx: mpsc::Sender<ClientInner>) -> io::Result<Core> {
 
 impl Drop for ServerInner {
     fn drop(&mut self) {
-        drop(self.tx.take());
-        self.thread.take().unwrap().join().unwrap();
+        drop(self.stop());
     }
 }
 

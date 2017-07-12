@@ -1,5 +1,7 @@
 from autopush_rs._native import ffi, lib
+from twisted.application import service
 from twisted.internet import reactor
+from autopush.websocket import PushServerProtocol
 import json
 
 # TODO: should use the new `ffi.def_extern` style callbacks, requires changes to
@@ -16,32 +18,74 @@ global_server = None
 
 def _reactor_server_ready(id):
     global global_server
-    assert(global_server is not None)
+    if global_server is None:
+        return
     if id == 0:
-        global_server.accept_clients()
+        global_server._accept_clients()
     else:
         global_server._client_ready(id)
 
-class AutopushServer:
-    def __init__(self, addr):
-        global global_server
-        assert(global_server is None)
+def ffi_from_buffer(s):
+    if s is None:
+        return ffi.NULL
+    else:
+        return ffi.from_buffer(s)
 
-        ptr = _call(lib.autopush_server_new,
-                    addr,
-                    _dispatch_server_ready_to_reactor)
+class AutopushServer(service.Service):
+    def __init__(self, settings, db, agent, clients):
+        cfg = ffi.new('AutopushServerOptions*')
+        cfg.auto_ping_interval = settings.auto_ping_interval
+        cfg.auto_ping_timeout = settings.auto_ping_timeout
+        cfg.close_handshake_timeout = settings.close_handshake_timeout
+        cfg.max_connections = settings.max_connections
+        cfg.open_handshake_timeout = 5
+        cfg.port = settings.port
+        cfg.ssl_cert = ffi_from_buffer(settings.ssl_cert)
+        cfg.ssl_dh_param = ffi_from_buffer(settings.ssl_dh_param)
+        cfg.ssl_key = ffi_from_buffer(settings.ssl_key)
+        cfg.url = ffi_from_buffer(settings.ws_url)
+
+        ptr = _call(lib.autopush_server_new, cfg)
         self.ffi = ffi.gc(ptr, lib.autopush_server_free)
+
         self.clients = []
         self.next_idx = 0
 
+        class Factory:
+            pass
+
+        self.factory = Factory()
+        self.factory.ap_settings = settings
+        self.factory.db = db
+        self.factory.agent = agent
+        self.factory.clients = clients
+
+    def startService(self):
+        global global_server
+        assert(global_server is None)
         global_server = self
+        _call(lib.autopush_server_start,
+              self.ffi,
+              _dispatch_server_ready_to_reactor)
+        self._accept_clients()
+
+    def stopService(self):
+        global global_server
+        assert(global_server is not None)
+        _call(lib.autopush_server_stop, self.ffi)
+        while len(self.clients) > 0:
+            self._remove_client(0)
+        self._free_ffi()
+        global_server = None
 
     # Accepts all pending clients
-    def accept_clients(self):
+    def _accept_clients(self):
         while True:
             client = self._accept_client()
             if client is None:
                 break
+
+            client.protocol.onConnect(None)
 
             # Push this client on our local slab of clients
             id = self.next_idx
@@ -57,17 +101,21 @@ class AutopushServer:
             self._client_ready(id + 1)
 
     def _client_ready(self, id):
-        id = id - 1
-        if id >= len(self.clients):
+        idx = id - 1
+        if idx >= len(self.clients):
             return
 
-        # Move the client forward. If it's not done yet we bail out, but if
+        # Move the client forward. If it's not done yet keep going, but if
         # it's finished then we remove its internal resources.
-        client = self.clients[id]
-        if client._poll():
-            return
-        self.clients[id] = self.next_idx
-        self.next_idx = id
+        if self.clients[idx]._poll():
+            pass
+        else:
+            self._remove_client(idx)
+
+    def _remove_client(self, idx):
+        client = self.clients[idx]
+        self.clients[idx] = self.next_idx
+        self.next_idx = idx
         client._free_ffi()
 
     # Attempt to accept a client.
@@ -82,27 +130,61 @@ class AutopushServer:
         ret = _call(lib.autopush_server_accept_client, self.ffi, self.next_idx + 1)
         if ffi.cast('size_t', ret) == 1:
             return None
-        return AutopushClient(ret)
+        return AutopushClient(ret, self.factory, self.next_idx + 1)
+
+    def _free_ffi(self):
+        ffi.gc(self.ffi, None)
+        lib.autopush_server_free(self.ffi)
+        self.ffi = None
+
+class AutopushTransport:
+    def __init__(self, id):
+        self._paused = False
+        self._message_queue = []
+        self.producer = None
+        self.id = id
+
+    def registerProducer(self, producer, streaming):
+        assert(streaming)
+        self.producer = producer
+
+    def pauseProducing(self):
+        self._paused = True
+
+    def resumeProducing(self):
+        self._paused = False
+        reactor.callLater(0, _reactor_server_ready, self.id)
 
 class AutopushClient:
-    def __init__(self, ptr):
+    def __init__(self, ptr, factory, id):
         self.ffi = ffi.gc(ptr, lib.autopush_client_free)
         self.done = False
-        self.message_queue = []
+        self.id = id
+        self.protocol = PushServerProtocol()
+        self.protocol.factory = factory
+        self.protocol._log_exc = False
+        self.protocol.transport = AutopushTransport(id)
+        self.protocol.autoPingInterval = factory.ap_settings.auto_ping_interval
+
+        def sendMessage(self, msg, binary):
+            assert(not binary)
+            self.transport._message_queue.append(AutopushMessage.from_str(msg))
+            reactor.callLater(0, _reactor_server_ready, self.transport.id)
+        setattr(PushServerProtocol, 'sendMessage', sendMessage)
 
     def _poll(self):
-        while not self.done:
+        while not self.done and not self.protocol.transport._paused:
             msg = self._poll_incoming()
             if msg is None:
                 break
-            print('client message: ' + str(msg.json()))
+            j = msg.json()
             msg._free_ffi()
-            self.message_queue.append(AutopushMessage.from_json({"c": 0}))
+            self.protocol.onMessage(json.dumps(j), False)
 
-        while not self.done and len(self.message_queue) > 0:
+        while not self.done and len(self.protocol.transport._message_queue) > 0:
             ret = _call(lib.autopush_client_send,
                         self.ffi,
-                        self.message_queue[0].ffi)
+                        self.protocol.transport._message_queue[0].ffi)
 
             # Indicates a write failure to the client, so we just abort and
             # clean ourselves up.
@@ -117,7 +199,7 @@ class AutopushClient:
             # Otherwise we successfully sent the message, so take our message
             # out of the queue.
             else:
-                msg = self.message_queue.pop(0)
+                msg = self.protocol.transport._message_queue.pop(0)
                 msg._free_ffi()
 
         return not self.done
@@ -134,7 +216,7 @@ class AutopushClient:
             return AutopushMessage(ret)
 
     def _free_ffi(self):
-        for msg in self.message_queue:
+        for msg in self.protocol.transport._message_queue:
             msg._free_ffi()
         ffi.gc(self.ffi, None)
         lib.autopush_client_free(self.ffi)
@@ -145,8 +227,7 @@ class AutopushMessage:
         self.ffi = ffi.gc(ptr, lib.autopush_message_free)
 
     @classmethod
-    def from_json(cls, j):
-        s = json.dumps(j)
+    def from_str(cls, s):
         ptr = _call(lib.autopush_message_new, s)
         return cls(ptr)
 

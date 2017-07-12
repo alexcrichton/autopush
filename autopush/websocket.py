@@ -105,7 +105,6 @@ from autopush.utils import (
     ms_time
 )
 
-
 USER_RECORD_VERSION = 1
 DEFAULT_WS_ERR = "http://autopush.readthedocs.io/en/" \
                  "latest/api/websocket.html#private-http-endpoint"
@@ -228,11 +227,18 @@ class PushState(object):
     @classmethod
     def from_request(cls, request, **kwargs):
         # type: (ConnectionRequest, **Any) -> PushState
-        return cls(
-            user_agent=request.headers.get("user-agent"),
-            stats=SessionStatistics(host=request.host),
-            **kwargs
-        )
+        if request is None:
+            return cls(
+                user_agent='test',
+                stats=SessionStatistics(host='host'),
+                **kwargs
+            )
+        else:
+            return cls(
+                user_agent=request.headers.get("user-agent"),
+                stats=SessionStatistics(host=request.host),
+                **kwargs
+            )
 
     def __attrs_post_init__(self):
         """Initialize PushState"""
@@ -320,7 +326,7 @@ class PushState(object):
         self._should_stop = True
 
 
-class PushServerProtocol(WebSocketServerProtocol, policies.TimeoutMixin):
+class PushServerProtocol(policies.TimeoutMixin):
     """Main Websocket Connection Protocol"""
     log = Logger()
 
@@ -1525,28 +1531,6 @@ class PushServerProtocol(WebSocketServerProtocol, policies.TimeoutMixin):
             self.sendJSON(msg)
 
 
-class PushServerFactory(WebSocketServerFactory):
-    """PushServerProtocol factory"""
-
-    protocol = PushServerProtocol
-
-    def __init__(self, ap_settings, db, agent, clients):
-        # type: (AutopushSettings, DatabaseManager, Agent, Dict) -> None
-        WebSocketServerFactory.__init__(self, ap_settings.ws_url)
-        self.ap_settings = ap_settings
-        self.db = db
-        self.agent = agent
-        self.clients = clients
-        self.setProtocolOptions(
-            webStatus=False,
-            openHandshakeTimeout=5,
-            autoPingInterval=ap_settings.auto_ping_interval,
-            autoPingTimeout=ap_settings.auto_ping_timeout,
-            maxConnections=ap_settings.max_connections,
-            closeHandshakeTimeout=ap_settings.close_handshake_timeout,
-        )
-
-
 class RouterHandler(BaseHandler):
     """Router Handler
 
@@ -1614,36 +1598,6 @@ class NotificationHandler(BaseHandler):
         if client and client.ps.connected_at == int(connected_at):
             client.sendClose()
             self.write("Terminated duplicate")
-
-
-class ConnectionWSSite(Site):
-
-    """The Websocket Site"""
-
-    def __init__(self, ap_settings, ws_factory):
-        # type: (AutopushSettings, PushServerFactory) -> None
-        self.ap_settings = ap_settings
-        self.noisy = ap_settings.debug
-
-        resource = DefaultResource(WebSocketResource(ws_factory))
-        resource.putChild("status", StatusResource())
-        Site.__init__(self, resource)
-
-    def ssl_cf(self):
-        # type: () -> Optional[AutopushSSLContextFactory]
-        """Build our SSL Factory (if configured).
-
-        Configured from the ssl_key/cert/dh_param values.
-
-        """
-        settings = self.ap_settings
-        if not settings.ssl_key:
-            return None
-        return AutopushSSLContextFactory(
-            settings.ssl_key,
-            settings.ssl_cert,
-            dh_file=settings.ssl_dh_param
-        )
 
 
 class DefaultResource(Resource):
