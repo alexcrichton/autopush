@@ -1,3 +1,4 @@
+#[macro_use]
 extern crate futures;
 extern crate libc;
 extern crate tokio_core;
