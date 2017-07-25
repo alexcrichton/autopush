@@ -9,11 +9,14 @@ crate-type = ["cdylib"]
 [dependencies]
 error-chain = "0.10"
 futures = "0.1"
+hyper = "0.11"
 libc = "0.2"
 serde = "1.0"
 serde_derive = "1.0"
 serde_json = "1.0"
+time = "0.1"
 tokio-core = "0.1"
+tokio-service = "0.1"
 tokio-tungstenite = { git = 'https://github.com/alexcrichton/tokio-tungstenite', branch = 'ping-pong' }
 tungstenite = { git = 'https://github.com/alexcrichton/tungstenite-rs', branch = 'ctl-pong' }
 uuid = { version = "0.5", features = ["serde", "v4"] }

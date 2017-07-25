@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::ffi::CStr;
 use std::io;
 use std::panic;
@@ -18,18 +19,28 @@ use tokio_core::net::{TcpListener, TcpStream};
 use tokio_core::reactor::{Core, Timeout, Handle, Interval};
 use tokio_tungstenite::{accept_async, WebSocketStream};
 use tungstenite::Message;
+use uuid::Uuid;
 
 use MyNotify;
 use call::{PythonCall, AutopushPythonCall};
-use client::Client;
+use client::{Client, ClientState, Channel};
 use errors::*;
-use protocol::{ClientMessage, ServerMessage};
+use protocol::{ClientMessage, ServerMessage, Notification, Update};
 use rt::{self, AutopushError, UnwindGuard};
 use util::{RcObject, timeout};
 
 #[repr(C)]
 pub struct AutopushServer {
-    inner: UnwindGuard<ServerInner>,
+    inner: UnwindGuard<AutopushServerInner>,
+}
+
+struct AutopushServerInner {
+    notify: RefCell<Arc<MyNotify>>,
+    rx: RefCell<Spawn<mpsc::Receiver<PythonCall>>>,
+
+    // Used when shutting down a server
+    tx: Cell<Option<oneshot::Sender<()>>>,
+    thread: Cell<Option<thread::JoinHandle<()>>>,
 }
 
 #[repr(C)]
@@ -47,27 +58,26 @@ pub struct AutopushServerOptions {
     pub close_handshake_timeout: u32,
 }
 
-pub struct ServerInner {
-    notify: RefCell<Arc<MyNotify>>,
-    rx: RefCell<Spawn<mpsc::Receiver<PythonCall>>>,
-
-    // Used when shutting down a server
-    tx: Cell<Option<oneshot::Sender<()>>>,
-    thread: Cell<Option<thread::JoinHandle<()>>>,
+pub struct Server {
+    channels: RefCell<HashMap<Uuid, Channel>>,
+    uaids: RefCell<HashMap<Uuid, ClientState>>,
+    open_connections: Cell<u32>,
+    pub opts: ServerOptions,
+    pub handle: Handle,
 }
 
-struct ServerOptions {
-    debug: bool,
-    port: u16,
-    url: String,
-    ssl_key: Option<PathBuf>,
-    ssl_cert: Option<PathBuf>,
-    ssl_dh_param: Option<PathBuf>,
-    open_handshake_timeout: Option<Duration>,
-    auto_ping_interval: Duration,
-    auto_ping_timeout: Duration,
-    max_connections: Option<u32>,
-    close_handshake_timeout: Option<Duration>,
+pub struct ServerOptions {
+    pub debug: bool,
+    pub port: u16,
+    pub url: String,
+    pub ssl_key: Option<PathBuf>,
+    pub ssl_cert: Option<PathBuf>,
+    pub ssl_dh_param: Option<PathBuf>,
+    pub open_handshake_timeout: Option<Duration>,
+    pub auto_ping_interval: Duration,
+    pub auto_ping_timeout: Duration,
+    pub max_connections: Option<u32>,
+    pub close_handshake_timeout: Option<Duration>,
 }
 
 #[no_mangle]
@@ -109,7 +119,7 @@ pub extern "C" fn autopush_server_new(opts: *const AutopushServerOptions,
         let opts = &*opts;
 
         // TODO: returning results to python?
-        let inner = ServerInner::new(ServerOptions {
+        let inner = AutopushServerInner::new(ServerOptions {
             debug: opts.debug != 0,
             port: opts.port,
             url: to_s(opts.url).expect("url must be specified").to_string(),
@@ -178,8 +188,14 @@ pub extern "C" fn autopush_server_free(srv: *mut AutopushServer) {
     })
 }
 
-impl ServerInner {
-    fn new(opts: ServerOptions) -> io::Result<ServerInner> {
+impl AutopushServerInner {
+    /// Creates a new server handle to send to python.
+    ///
+    /// This will spawn a new server with the `opts` specified, spinning up a
+    /// separate thread for the tokio reactor. The returned
+    /// `AutopushServerInner` is a handle to the spawned thread and can be used
+    /// to interact with it (e.g. shut it down).
+    fn new(opts: ServerOptions) -> io::Result<AutopushServerInner> {
         let (donetx, donerx) = oneshot::channel();
         let (inittx, initrx) = oneshot::channel();
         let (tx, rx) = mpsc::channel(100);
@@ -189,13 +205,34 @@ impl ServerInner {
         assert!(opts.ssl_dh_param.is_none(), "ssl not supported");
 
         let thread = thread::spawn(move || {
-            let mut core = match init(opts, tx) {
+            let (srv, mut core) = match Server::new(opts, tx) {
                 Ok(core) => {
                     inittx.send(None).unwrap();
                     core
                 }
                 Err(e) => return inittx.send(Some(e)).unwrap(),
             };
+
+            // For now during development spin up a dummy HTTP server which is
+            // used to send notifications to clients.
+            {
+                use hyper::server::Http;
+
+                let handle = core.handle();
+                let addr = "127.0.0.1:8081".parse().unwrap();
+                let push_listener = TcpListener::bind(&addr, &handle).unwrap();
+                let proto = Http::new();
+                let push_srv = push_listener.incoming().for_each(move |(socket, addr)| {
+                    proto.bind_connection(&handle, socket, addr,
+                                          ::http::Push(srv.clone()));
+                    Ok(())
+                });
+                core.handle().spawn(push_srv.then(|res| {
+                    println!("Http server {:?}", res);
+                    Ok(())
+                }));
+            }
+
             drop(core.run(donerx));
         });
 
@@ -204,7 +241,7 @@ impl ServerInner {
             Ok(None) => {
                 extern fn dummy(_: usize) {}
 
-                Ok(ServerInner {
+                Ok(AutopushServerInner {
                     rx: RefCell::new(spawn(rx)),
                     tx: Cell::new(Some(donetx)),
                     thread: Cell::new(Some(thread)),
@@ -217,6 +254,8 @@ impl ServerInner {
         }
     }
 
+    /// Check to see if there's any requests to call into python, returning if
+    /// any have been found.
     fn poll_call(&self) -> Option<PythonCall> {
         let mut rx = self.rx.borrow_mut();
         let notify = self.notify.borrow();
@@ -227,10 +266,8 @@ impl ServerInner {
         }
     }
 
-    pub fn notify(&self) -> Arc<MyNotify> {
-        self.notify.borrow().clone()
-    }
-
+    /// Blocks execution of the calling thread until the helper thread with the
+    /// tokio reactor has exited.
     fn stop(&self) -> Result<()> {
         drop(self.tx.take());
         if let Some(thread) = self.thread.take() {
@@ -240,86 +277,184 @@ impl ServerInner {
     }
 }
 
-fn init(opts: ServerOptions, tx: mpsc::Sender<PythonCall>) -> io::Result<Core> {
-    let opts = Rc::new(opts);
-    let core = Core::new()?;
-    let handle = core.handle();
-    let addr = format!("127.0.0.1:{}", opts.port);
-    let ws_listener = TcpListener::bind(&addr.parse().unwrap(), &handle)?;
-
-    assert!(opts.ssl_key.is_none(), "ssl not supported yet");
-    assert!(opts.ssl_cert.is_none(), "ssl not supported yet");
-    assert!(opts.ssl_dh_param.is_none(), "ssl not supported yet");
-
-    let handle = core.handle();
-    let open_timeout = opts.open_handshake_timeout;
-    let max_connections = opts.max_connections.unwrap_or(u32::max_value());
-    let open_connections = Rc::new(Cell::new(0));
-
-    let ws_srv = ws_listener.incoming()
-        .map_err(|e| Error::from(e))
-
-        .for_each(move |(socket, addr)| {
-            // Make sure we're not handling too many clients before we start the
-            // websocket handshake.
-            if open_connections.get() >= max_connections {
-                println!("dropping {} as we already have too many open \
-                          connections", addr);
-                return Ok(())
-            }
-            open_connections.set(open_connections.get() + 1);
-
-            // TODO: TCP socket options here?
-
-            // Perform the websocket handshake on each connection, but don't let
-            // it take too long.
-            let ws = accept_async(socket).chain_err(|| "failed to accept client");
-            let ws = timeout(ws, open_timeout, &handle);
-
-            // Once the handshake is done we'll start the main communication
-            // with the client, managing pings here and deferring to `Client` to
-            // start driving the internal state machine.
-            let opts = opts.clone();
-            let handle2 = handle.clone();
-            let tx = tx.clone();
-            let client = ws.and_then(move |ws| {
-                PingManager::new(&opts, &handle2, tx, ws)
-                    .chain_err(|| "failed to make ping handler")
-            }).flatten();
-
-            let open_connections = open_connections.clone();
-            handle.spawn(client.then(move |res| {
-                open_connections.set(open_connections.get() - 1);
-                // TODO: log this? ignore this? unsure.
-                println!("{}: {:?}", addr, res);
-                Ok(())
-            }));
-
-            Ok(())
-        });
-
-    core.handle().spawn(ws_srv.then(|res| {
-        println!("srv res: {:?}", res.map(drop));
-        Ok(())
-    }));
-
-    Ok(core)
-}
-
-impl Drop for ServerInner {
+impl Drop for AutopushServerInner {
     fn drop(&mut self) {
         drop(self.stop());
     }
 }
 
+impl Server {
+    fn new(opts: ServerOptions, tx: mpsc::Sender<PythonCall>)
+        -> io::Result<(Rc<Server>, Core)>
+    {
+        let core = Core::new()?;
+        let srv = Rc::new(Server {
+            opts: opts,
+            channels: RefCell::new(HashMap::new()),
+            uaids: RefCell::new(HashMap::new()),
+            open_connections: Cell::new(0),
+            handle: core.handle(),
+        });
+        let addr = format!("127.0.0.1:{}", srv.opts.port);
+        let ws_listener = TcpListener::bind(&addr.parse().unwrap(), &srv.handle)?;
+
+        assert!(srv.opts.ssl_key.is_none(), "ssl not supported yet");
+        assert!(srv.opts.ssl_cert.is_none(), "ssl not supported yet");
+        assert!(srv.opts.ssl_dh_param.is_none(), "ssl not supported yet");
+
+        let handle = core.handle();
+        let srv2 = srv.clone();
+        let ws_srv = ws_listener.incoming()
+            .map_err(|e| Error::from(e))
+
+            .for_each(move |(socket, addr)| {
+                // Make sure we're not handling too many clients before we start the
+                // websocket handshake.
+                let max = srv.opts.max_connections.unwrap_or(u32::max_value());
+                if srv.open_connections.get() >= max {
+                    println!("dropping {} as we already have too many open \
+                              connections", addr);
+                    return Ok(())
+                }
+                srv.open_connections.set(srv.open_connections.get() + 1);
+
+                // TODO: TCP socket options here?
+
+                // Perform the websocket handshake on each connection, but don't let
+                // it take too long.
+                let ws = accept_async(socket).chain_err(|| "failed to accept client");
+                let ws = timeout(ws, srv.opts.open_handshake_timeout, &handle);
+
+                // Once the handshake is done we'll start the main communication
+                // with the client, managing pings here and deferring to `Client` to
+                // start driving the internal state machine.
+                let srv2 = srv.clone();
+                let tx = tx.clone();
+                let client = ws.and_then(move |ws| {
+                    PingManager::new(&srv2, tx, ws)
+                        .chain_err(|| "failed to make ping handler")
+                }).flatten();
+
+                let srv = srv.clone();
+                handle.spawn(client.then(move |res| {
+                    srv.open_connections.set(srv.open_connections.get() - 1);
+                    if let Err(e) = res {
+                        // TODO: log this? ignore this? unsure.
+                        println!("{}: {}", addr, e);
+                        for err in e.iter().skip(1) {
+                            println!("\t{}", err);
+                        }
+                    }
+                    Ok(())
+                }));
+
+                Ok(())
+            });
+
+        core.handle().spawn(ws_srv.then(|res| {
+            println!("srv res: {:?}", res.map(drop));
+            Ok(())
+        }));
+
+        Ok((srv2, core))
+    }
+
+    /// Informs this server that a new `client` has connected
+    ///
+    /// For now just registers internal state by keeping track of the `client`,
+    /// namely its channel to send notifications back.
+    pub fn connect_client(&self, client: ClientState) {
+        // TODO: handle already-present channels
+        for id in client.channel_ids.iter() {
+            assert!(self.channels.borrow_mut().insert(*id, Channel {
+                uaid: client.uaid,
+                current_version: 0,
+            }).is_none());
+        }
+
+        // TODO: if this is a duplicate we should respond by requesting the
+        //       client selects a new uaid
+        assert!(self.uaids.borrow_mut().insert(client.uaid, client).is_none());
+    }
+
+    /// The client specified by `uaid` has just started listening to the channel
+    /// identified as `channel_id`.
+    pub fn register_channel(&self, uaid: &Uuid, channel_id: &Uuid) -> bool {
+        let mut uaids = self.uaids.borrow_mut();
+        let mut channels = self.channels.borrow_mut();
+        let client = uaids.get_mut(uaid).unwrap();
+        if channels.contains_key(channel_id) {
+            false
+        } else {
+            channels.insert(*channel_id, Channel {
+                uaid: *uaid,
+                current_version: 0,
+            });
+            client.channel_ids.push(*channel_id);
+            true
+        }
+    }
+
+    /// The client specified by `uaid` has stopped listening to the channel
+    /// specified by `channel_id`.
+    pub fn unregister_channel(&self, uaid: &Uuid, channel_id: &Uuid) {
+        let mut uaids = self.uaids.borrow_mut();
+        let mut channels = self.channels.borrow_mut();
+        let client = uaids.get_mut(uaid).unwrap();
+        if channels.contains_key(channel_id) {
+            if channels[channel_id].uaid == *uaid {
+                channels.remove(channel_id);
+                client.channel_ids.retain(|c| {
+                    c != channel_id
+                });
+            }
+        }
+    }
+
+    /// A notification has come for the channel specified by `channel_id` and
+    /// the channel is now at the version specified as well.
+    pub fn notify_client(&self, channel_id: &Uuid, version: u64) {
+        let mut channels = self.channels.borrow_mut();
+        let channel = match channels.get_mut(&channel_id) {
+            Some(channel) => channel,
+            None => return,
+        };
+        channel.current_version = version;
+
+        let mut uaids = self.uaids.borrow_mut();
+        let uaid = uaids.get_mut(&channel.uaid).unwrap();
+        let notification = if uaid.use_webpush {
+            Notification::WebPush {
+                channel_id: *channel_id,
+                version: version.to_string(),
+            }
+        } else {
+            Notification::Simple {
+                updates: vec![Update {
+                    channel_id: *channel_id,
+                    version: version,
+                }],
+            }
+        };
+        (&uaid.tx).send(notification).unwrap();
+    }
+
+    /// The client specified by `uaid` has disconnected.
+    pub fn disconnet_client(&self, uaid: &Uuid) {
+        let mut uaids = self.uaids.borrow_mut();
+        let mut channels = self.channels.borrow_mut();
+        for id in uaids.remove(uaid).expect("uaid not registered").channel_ids {
+            channels.remove(&id).expect("uaid pointed to missing channel");
+        }
+    }
+}
+
 struct PingManager {
-    handle: Handle,
     socket: RcObject<WebSocketStream<TcpStream>>,
     ping_interval: Interval,
     timeout: TimeoutState,
-    ping_timeout_dur: Duration,
-    close_handshake_timeout: Option<Duration>,
-    client: State<Client<WebpushSocket<RcObject<WebSocketStream<TcpStream>>>>>,
+    srv: Rc<Server>,
+    client: CloseState<Client<WebpushSocket<RcObject<WebSocketStream<TcpStream>>>>>,
 }
 
 enum TimeoutState {
@@ -328,14 +463,13 @@ enum TimeoutState {
     Close(Timeout),
 }
 
-enum State<T> {
+enum CloseState<T> {
     Exchange(T),
     Closing,
 }
 
 impl PingManager {
-    fn new(opts: &ServerOptions,
-           handle: &Handle,
+    fn new(srv: &Rc<Server>,
            tx: mpsc::Sender<PythonCall>,
            socket: WebSocketStream<TcpStream>)
         -> io::Result<PingManager>
@@ -356,13 +490,11 @@ impl PingManager {
         // management and message shuffling.
         let socket = RcObject::new(socket);
         Ok(PingManager {
-            handle: handle.clone(),
-            ping_interval: Interval::new(opts.auto_ping_interval, handle)?,
-            ping_timeout_dur: opts.auto_ping_timeout,
+            ping_interval: Interval::new(srv.opts.auto_ping_interval, &srv.handle)?,
             timeout: TimeoutState::None,
             socket: socket.clone(),
-            client: State::Exchange(Client::new(WebpushSocket(socket), tx)),
-            close_handshake_timeout: opts.close_handshake_timeout,
+            client: CloseState::Exchange(Client::new(WebpushSocket(socket), tx, srv)),
+            srv: srv.clone(),
         })
     }
 }
@@ -380,7 +512,7 @@ impl Future for PingManager {
                 _ => continue,
             }
             self.socket.borrow_mut().send_ping(Vec::new())?;
-            let timeout = Timeout::new(self.ping_timeout_dur, &self.handle)?;
+            let timeout = Timeout::new(self.srv.opts.auto_ping_timeout, &self.srv.handle)?;
             self.timeout = TimeoutState::Ping(timeout);
         }
 
@@ -414,13 +546,13 @@ impl Future for PingManager {
         // closing handshake.
         loop {
             match self.client {
-                State::Exchange(ref mut client) => try_ready!(client.poll()),
-                State::Closing => return Ok(self.socket.close()?),
+                CloseState::Exchange(ref mut client) => try_ready!(client.poll()),
+                CloseState::Closing => return Ok(self.socket.close()?),
             }
 
-            self.client = State::Closing;
-            if let Some(dur) = self.close_handshake_timeout {
-                let timeout = Timeout::new(dur, &self.handle)?;
+            self.client = CloseState::Closing;
+            if let Some(dur) = self.srv.opts.close_handshake_timeout {
+                let timeout = Timeout::new(dur, &self.srv.handle)?;
                 self.timeout = TimeoutState::Close(timeout);
             }
         }
