@@ -22,6 +22,10 @@ class Dispatch:
         if call.name() == 'add':
             a, b = call.args()
             call.complete(a + b)
+        if call.name() == 'verify-hello':
+            uaid = call.args()
+            print('connecting ' + uaid)
+            call.complete(200)
         else:
             call.cancel()
             raise RuntimeError("unknown call: {}".format(call.name()))

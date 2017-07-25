@@ -22,6 +22,7 @@ pub struct ClientState {
     pub use_webpush: bool,
     pub channel_ids: Vec<Uuid>,
     pub tx: mpsc::UnboundedSender<Notification>,
+    pub call: mpsc::UnboundedSender<PythonCall>,
 }
 
 pub struct Channel {
@@ -45,9 +46,9 @@ impl<T> Client<T>
     /// The `srv` argument is the server that this client is attached to and
     /// the various state behind the server.
     pub fn new(ws: T,
-               _tx: mpsc::Sender<PythonCall>,
+               tx: mpsc::UnboundedSender<PythonCall>,
                srv: &Rc<Server>) -> Client<T> {
-        let client = Client::handshake(ws);
+        let client = Client::handshake(ws, tx);
         let client = timeout(client, srv.opts.open_handshake_timeout, &srv.handle);
 
         let srv = srv.clone();
@@ -65,7 +66,9 @@ impl<T> Client<T>
         }
     }
 
-    fn handshake(ws: T) -> MyFuture<(T, ClientState, mpsc::UnboundedReceiver<Notification>)> {
+    fn handshake(ws: T, call: mpsc::UnboundedSender<PythonCall>)
+        -> MyFuture<(T, ClientState, mpsc::UnboundedReceiver<Notification>)>
+    {
         Box::new(ws.into_future().then(move |res| -> MyFuture<_> {
             let (msg, ws) = match res {
                 Ok(pair) => pair,
@@ -86,17 +89,22 @@ impl<T> Client<T>
                         use_webpush: use_webpush.unwrap_or(false),
                         channel_ids: channel_ids.unwrap_or(Vec::new()),
                         tx: tx,
+                        call: call,
                     }
                 }
                 _ => return Box::new(err("non-hello message before handshake".into())),
             };
-            let response = ServerMessage::Hello {
-                uaid: client.uaid,
-                status: 200,
-                use_webpush: Some(client.use_webpush),
-            };
-            Box::new(ws.send(response).map(|ws| {
-                (ws, client, rx)
+            let (call, response) = PythonCall::new("verify-hello", client.uaid);
+            (&client.call).send(call).expect("python is gone?");
+            Box::new(response.and_then(|status| {
+                let response = ServerMessage::Hello {
+                    uaid: client.uaid,
+                    status: status,
+                    use_webpush: Some(client.use_webpush),
+                };
+                ws.send(response).map(|ws| {
+                    (ws, client, rx)
+                })
             }))
         }))
     }

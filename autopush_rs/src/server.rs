@@ -36,7 +36,7 @@ pub struct AutopushServer {
 
 struct AutopushServerInner {
     notify: RefCell<Arc<MyNotify>>,
-    rx: RefCell<Spawn<mpsc::Receiver<PythonCall>>>,
+    rx: RefCell<Spawn<mpsc::UnboundedReceiver<PythonCall>>>,
 
     // Used when shutting down a server
     tx: Cell<Option<oneshot::Sender<()>>>,
@@ -198,7 +198,7 @@ impl AutopushServerInner {
     fn new(opts: ServerOptions) -> io::Result<AutopushServerInner> {
         let (donetx, donerx) = oneshot::channel();
         let (inittx, initrx) = oneshot::channel();
-        let (tx, rx) = mpsc::channel(100);
+        let (tx, rx) = mpsc::unbounded();
 
         assert!(opts.ssl_key.is_none(), "ssl not supported");
         assert!(opts.ssl_cert.is_none(), "ssl not supported");
@@ -284,7 +284,7 @@ impl Drop for AutopushServerInner {
 }
 
 impl Server {
-    fn new(opts: ServerOptions, tx: mpsc::Sender<PythonCall>)
+    fn new(opts: ServerOptions, tx: mpsc::UnboundedSender<PythonCall>)
         -> io::Result<(Rc<Server>, Core)>
     {
         let core = Core::new()?;
@@ -470,7 +470,7 @@ enum CloseState<T> {
 
 impl PingManager {
     fn new(srv: &Rc<Server>,
-           tx: mpsc::Sender<PythonCall>,
+           tx: mpsc::UnboundedSender<PythonCall>,
            socket: WebSocketStream<TcpStream>)
         -> io::Result<PingManager>
     {
