@@ -12,8 +12,8 @@ dependencies = [
  "time 0.1.38 (registry+https://github.com/rust-lang/crates.io-index)",
  "tokio-core 0.1.8 (registry+https://github.com/rust-lang/crates.io-index)",
  "tokio-service 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "tokio-tungstenite 0.2.1 (git+https://github.com/alexcrichton/tokio-tungstenite?branch=ping-pong)",
- "tungstenite 0.2.4 (git+https://github.com/alexcrichton/tungstenite-rs?branch=ctl-pong)",
+ "tokio-tungstenite 0.2.1 (git+https://github.com/alexcrichton/tokio-tungstenite?branch=upgrade)",
+ "tungstenite 0.3.0 (git+https://github.com/snapview/tungstenite-rs)",
  "uuid 0.5.1 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
@@ -612,7 +612,7 @@ dependencies = [
 [[package]]
 name = "tokio-tungstenite"
 version = "0.2.1"
-source = "git+https://github.com/alexcrichton/tokio-tungstenite?branch=ping-pong#f4a661efa5934a7563514ace1f40787ccd40da90"
+source = "git+https://github.com/alexcrichton/tokio-tungstenite?branch=upgrade#362adcf53233c7e7ff50d5a0b188666eefa2d895"
 dependencies = [
  "bytes 0.4.4 (registry+https://github.com/rust-lang/crates.io-index)",
  "futures 0.1.14 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -621,14 +621,14 @@ dependencies = [
  "tokio-dns-unofficial 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "tokio-io 0.1.2 (registry+https://github.com/rust-lang/crates.io-index)",
  "tokio-tls 0.1.3 (registry+https://github.com/rust-lang/crates.io-index)",
- "tungstenite 0.2.4 (git+https://github.com/alexcrichton/tungstenite-rs?branch=ctl-pong)",
+ "tungstenite 0.3.0 (git+https://github.com/snapview/tungstenite-rs)",
  "url 1.5.1 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
 name = "tungstenite"
-version = "0.2.4"
-source = "git+https://github.com/alexcrichton/tungstenite-rs?branch=ctl-pong#7d1428085edb620df96527070aba55d9e64fb030"
+version = "0.3.0"
+source = "git+https://github.com/snapview/tungstenite-rs#147ca9e4d3fd8397c6ada372c963c926502b8cd6"
 dependencies = [
  "base64 0.5.2 (registry+https://github.com/rust-lang/crates.io-index)",
  "byteorder 1.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -787,8 +787,8 @@ dependencies = [
 "checksum tokio-proto 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)" = "8fbb47ae81353c63c487030659494b295f6cb6576242f907f203473b191b0389"
 "checksum tokio-service 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)" = "24da22d077e0f15f55162bdbdc661228c1581892f52074fb242678d015b45162"
 "checksum tokio-tls 0.1.3 (registry+https://github.com/rust-lang/crates.io-index)" = "d88e411cac1c87e405e4090be004493c5d8072a370661033b1a64ea205ec2e13"
-"checksum tokio-tungstenite 0.2.1 (git+https://github.com/alexcrichton/tokio-tungstenite?branch=ping-pong)" = "<none>"
-"checksum tungstenite 0.2.4 (git+https://github.com/alexcrichton/tungstenite-rs?branch=ctl-pong)" = "<none>"
+"checksum tokio-tungstenite 0.2.1 (git+https://github.com/alexcrichton/tokio-tungstenite?branch=upgrade)" = "<none>"
+"checksum tungstenite 0.3.0 (git+https://github.com/snapview/tungstenite-rs)" = "<none>"
 "checksum unicase 2.0.0 (registry+https://github.com/rust-lang/crates.io-index)" = "2e01da42520092d0cd2d6ac3ae69eb21a22ad43ff195676b86f8c37f487d6b80"
 "checksum unicode-bidi 0.3.4 (registry+https://github.com/rust-lang/crates.io-index)" = "49f2bd0c6468a8230e1db229cff8029217cf623c767ea5d60bfbd42729ea54d5"
 "checksum unicode-normalization 0.1.5 (registry+https://github.com/rust-lang/crates.io-index)" = "51ccda9ef9efa3f7ef5d91e8f9b83bbe6955f9bf86aec89d5cce2c874625920f"

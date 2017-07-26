@@ -2,6 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::io;
+use std::mem;
 use std::panic;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -12,6 +13,7 @@ use std::time::Duration;
 use futures::executor::{spawn, Spawn};
 use futures::sync::mpsc;
 use futures::sync::oneshot;
+use futures::task::{self, Task};
 use futures::{Stream, Future, Sink, Async, Poll, AsyncSink, StartSend};
 use libc::c_char;
 use serde_json;
@@ -450,11 +452,11 @@ impl Server {
 }
 
 struct PingManager {
-    socket: RcObject<WebSocketStream<TcpStream>>,
+    socket: RcObject<WebpushSocket<WebSocketStream<TcpStream>>>,
     ping_interval: Interval,
     timeout: TimeoutState,
     srv: Rc<Server>,
-    client: CloseState<Client<WebpushSocket<RcObject<WebSocketStream<TcpStream>>>>>,
+    client: CloseState<Client<RcObject<WebpushSocket<WebSocketStream<TcpStream>>>>>,
 }
 
 enum TimeoutState {
@@ -488,12 +490,12 @@ impl PingManager {
         // To make these tasks easier we start out by throwing the `socket` into
         // an `Rc` object. This'll allow us to share it between the ping/pong
         // management and message shuffling.
-        let socket = RcObject::new(socket);
+        let socket = RcObject::new(WebpushSocket::new(socket));
         Ok(PingManager {
             ping_interval: Interval::new(srv.opts.auto_ping_interval, &srv.handle)?,
             timeout: TimeoutState::None,
             socket: socket.clone(),
-            client: CloseState::Exchange(Client::new(WebpushSocket(socket), tx, srv)),
+            client: CloseState::Exchange(Client::new(socket, tx, srv)),
             srv: srv.clone(),
         })
     }
@@ -511,7 +513,7 @@ impl Future for PingManager {
                 TimeoutState::None => {}
                 _ => continue,
             }
-            self.socket.borrow_mut().send_ping(Vec::new())?;
+            self.socket.borrow_mut().ping = true;
             let timeout = Timeout::new(self.srv.opts.auto_ping_timeout, &self.srv.handle)?;
             self.timeout = TimeoutState::Ping(timeout);
         }
@@ -561,7 +563,49 @@ impl Future for PingManager {
 
 // Wrapper struct to take a Sink/Stream of `Message` to a Sink/Stream of
 // `ClientMessage` and `ServerMessage`.
-struct WebpushSocket<T>(T);
+struct WebpushSocket<T> {
+    inner: T,
+    pong: Pong,
+    ping: bool,
+}
+
+enum Pong {
+    None,
+    Received,
+    Waiting(Task),
+}
+
+impl<T> WebpushSocket<T> {
+    fn new(t: T) -> WebpushSocket<T> {
+        WebpushSocket {
+            inner: t,
+            pong: Pong::None,
+            ping: false,
+        }
+    }
+
+    fn poll_pong(&mut self) -> Async<()> {
+        match mem::replace(&mut self.pong, Pong::None) {
+            Pong::None => {}
+            Pong::Received => return Async::Ready(()),
+            Pong::Waiting(_) => {}
+        }
+        self.pong = Pong::Waiting(task::current());
+        Async::NotReady
+    }
+
+    fn send_ping(&mut self) -> Poll<(), Error>
+        where T: Sink<SinkItem = Message>, Error: From<T::SinkError>
+    {
+        if self.ping {
+            match self.inner.start_send(Message::Ping(Vec::new()))? {
+                AsyncSink::Ready => self.ping = false,
+                AsyncSink::NotReady(_) => return Ok(Async::NotReady),
+            }
+        }
+        Ok(Async::Ready(()))
+    }
+}
 
 impl<T> Stream for WebpushSocket<T>
     where T: Stream<Item = Message>,
@@ -571,13 +615,35 @@ impl<T> Stream for WebpushSocket<T>
     type Error = Error;
 
     fn poll(&mut self) -> Poll<Option<ClientMessage>, Error> {
-        match try_ready!(self.0.poll()) {
-            Some(Message::Text(ref s)) => {
-                let msg = serde_json::from_str(s).chain_err(|| "invalid json text")?;
-                Ok(Some(msg).into())
+        loop {
+            match try_ready!(self.inner.poll()) {
+                Some(Message::Text(ref s)) => {
+                    let msg = serde_json::from_str(s).chain_err(|| "invalid json text")?;
+                    return Ok(Some(msg).into())
+                }
+
+                Some(Message::Binary(_)) => {
+                    return Err("binary messages not accepted".into())
+                }
+
+                // sending a pong is already managed by lower layers, just go to
+                // the next message
+                Some(Message::Ping(_)) => {}
+
+                // Wake up tasks waiting for a pong, if any.
+                Some(Message::Pong(_)) => {
+                    match mem::replace(&mut self.pong, Pong::Received) {
+                        Pong::None => {}
+                        Pong::Received => {}
+                        Pong::Waiting(task) => {
+                            self.pong = Pong::None;
+                            task.notify();
+                        }
+                    }
+                }
+
+                None => return Ok(None.into()),
             }
-            Some(Message::Binary(_)) => Err("binary messages not accepted".into()),
-            None => Ok(None.into()),
         }
     }
 }
@@ -592,18 +658,23 @@ impl<T> Sink for WebpushSocket<T>
     fn start_send(&mut self, msg: ServerMessage)
         -> StartSend<ServerMessage, Error>
     {
+        if self.send_ping()?.is_not_ready() {
+            return Ok(AsyncSink::NotReady(msg))
+        }
         let s = serde_json::to_string(&msg).chain_err(|| "failed to serialize")?;
-        match self.0.start_send(Message::Text(s))? {
+        match self.inner.start_send(Message::Text(s))? {
             AsyncSink::Ready => Ok(AsyncSink::Ready),
             AsyncSink::NotReady(_) => Ok(AsyncSink::NotReady(msg)),
         }
     }
 
     fn poll_complete(&mut self) -> Poll<(), Error> {
-        Ok(self.0.poll_complete()?)
+        try_ready!(self.send_ping());
+        Ok(self.inner.poll_complete()?)
     }
 
     fn close(&mut self) -> Poll<(), Error> {
-        Ok(self.0.close()?)
+        try_ready!(self.poll_complete());
+        Ok(self.inner.close()?)
     }
 }
